@@ -1,0 +1,12 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) core
+
+override_dh_auto_install:
+	install -d debian/parrot-forensic-imager/usr/bin
+	install -m 0755 build/forensic-imager-core debian/parrot-forensic-imager/usr/bin/forensic-imager-core
+	install -m 0755 scripts/forensic-imager debian/parrot-forensic-imager/usr/bin/forensic-imager
