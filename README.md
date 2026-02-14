@@ -297,5 +297,8 @@ Debian packaging skeleton lives in `packaging/debian/`.
 
 ## License
 
-Add your license file (e.g., `LICENSE`) before publishing. Many forensic tools use Apache-2.0 or GPL-3.0; choose what matches your goals.
+Apache-2.0. See `LICENSE`.
 
+## Contributing
+
+See `CONTRIBUTING.md`.
