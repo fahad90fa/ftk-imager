@@ -11,6 +11,9 @@ from typing import Any
 from .audit import utc_now, write_audit_event
 from .devices import ensure_not_rw_mounted, get_device_info
 from .hashing import hash_file
+from .hashing import hash_segmented_prefix
+from .badsectors import write_bad_sector_maps
+from .safety import ensure_destination_safe, estimate_source_bytes, source_is_system_disk
 from .reporting import generate_text_report
 from .system_state import capture_system_state
 from .versioning import get_version_info
@@ -36,6 +39,11 @@ class AcquireOptions:
     require_writeblock: bool = False
     try_writeblock: bool = False
     auto_seal: bool = False
+    allow_system_disk: bool = False
+    allow_dest_on_source: bool = False
+    split_bytes: int = 0
+    read_error_mode: int = 0
+    read_retries: int = 3
 
 
 def parse_hash_file(path: Path) -> dict[str, str]:
@@ -77,6 +85,9 @@ def _run_core(opts: AcquireOptions, hash_path: Path, audit_log: Path, checkpoint
         str(opts.max_bytes),
         "1" if opts.append_mode else "0",
         str(opts.progress_interval),
+        str(opts.split_bytes),
+        str(opts.read_error_mode),
+        str(opts.read_retries),
     ]
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
     if proc.stderr is not None:
@@ -127,7 +138,13 @@ def _run_core(opts: AcquireOptions, hash_path: Path, audit_log: Path, checkpoint
 
 def _compute_image_hashes(image_path: Path, include_sha512: bool) -> dict[str, str]:
     algorithms = ("md5", "sha1", "sha256", "sha512") if include_sha512 else ("md5", "sha1", "sha256")
-    return hash_file(image_path, algorithms=algorithms)
+    if image_path.exists():
+        return hash_file(image_path, algorithms=algorithms)
+    # Support segmented raw output: <prefix>.001, <prefix>.002...
+    seg1 = Path(f"{image_path}.001")
+    if seg1.exists():
+        return hash_segmented_prefix(image_path, algorithms=algorithms)
+    raise FileNotFoundError(image_path)
 
 
 def run_acquisition(opts: AcquireOptions) -> dict[str, str]:
@@ -164,6 +181,23 @@ def run_acquisition(opts: AcquireOptions) -> dict[str, str]:
     )
 
     ensure_not_rw_mounted(opts.source)
+    if source_is_system_disk(opts.source) and not opts.allow_system_disk:
+        raise RuntimeError("source appears to be the system disk (contains mountpoint '/'); use --allow-system-disk to override")
+
+    # Preflight destination validation to prevent catastrophic operator mistakes.
+    total_estimated = estimate_source_bytes(opts.source, max_bytes=opts.max_bytes)
+    # If we're starting at an offset (resume or partial acquisition), only the remaining
+    # bytes must fit on the destination filesystem.
+    if opts.max_bytes > 0:
+        estimated = int(opts.max_bytes)
+    else:
+        estimated = max(int(total_estimated) - int(opts.start_offset), 0)
+    ensure_destination_safe(
+        source=opts.source,
+        output_path=opts.output_image.parent,
+        estimated_bytes=estimated,
+        allow_dest_on_source=opts.allow_dest_on_source,
+    )
     if opts.require_writeblock or opts.try_writeblock:
         # Best-effort software write blocking. Requires root if try_writeblock=True.
         from .writeblock import require_readonly, set_readonly  # local import to avoid hard dep in non-root tests
@@ -181,6 +215,9 @@ def run_acquisition(opts: AcquireOptions) -> dict[str, str]:
     _run_core(opts, hash_path=hash_path, audit_log=core_audit_log, checkpoint_path=checkpoint_path)
     segment_hashes = parse_hash_file(hash_path)
 
+    # Extract a formal bad-sector map for reporting/defensibility.
+    badmap = write_bad_sector_maps(opts.output_dir, core_audit_log)
+
     # Full-image hashes are legal/reporting-grade values used for long-term verification.
     full_hashes = _compute_image_hashes(opts.output_image, include_sha512=opts.sha512)
 
@@ -197,6 +234,7 @@ def run_acquisition(opts: AcquireOptions) -> dict[str, str]:
         "metadata_path": str(metadata_path),
         "system_state_path": str(system_state_path),
         "tool_info": tool_info,
+        "bad_sectors": badmap,
         "audit_log": str(audit_log),
         "core_audit_log": str(core_audit_log),
         "hashes": full_hashes,
@@ -207,7 +245,7 @@ def run_acquisition(opts: AcquireOptions) -> dict[str, str]:
         "absolute_end_offset": int(segment_hashes.get("absolute_end_offset", "0")),
         "started_at": started_at,
         "completed_at": completed_at,
-        "tool_version": "0.17.0",
+        "tool_version": "0.18.0",
         "hostname": os.uname().nodename,
     }
     case_path.write_text(json.dumps(case_data, indent=2, sort_keys=True), encoding="utf-8")
@@ -296,8 +334,22 @@ def run_resume(
     sha512: bool,
     core_binary: Path,
     progress_interval: int,
+    require_writeblock: bool = False,
+    try_writeblock: bool = False,
+    auto_seal: bool = False,
+    allow_system_disk: bool = False,
+    allow_dest_on_source: bool = False,
+    read_error_mode: int = 0,
+    read_retries: int = 3,
 ) -> dict[str, str]:
-    start_offset = output_image.stat().st_size if output_image.exists() else 0
+    # Resume is only supported for a single raw output file (no segmentation).
+    if not output_image.exists():
+        # If a segmented acquisition exists, make the failure mode explicit.
+        if Path(f"{output_image}.001").exists():
+            raise RuntimeError("resume is not supported for segmented outputs; re-run acquisition without --split-bytes")
+        start_offset = 0
+    else:
+        start_offset = output_image.stat().st_size
     checkpoint_path = output_dir / "checkpoint.json"
     if checkpoint_path.exists():
         checkpoint = load_checkpoint(checkpoint_path)
@@ -322,6 +374,14 @@ def run_resume(
         max_bytes=0,
         append_mode=start_offset > 0,
         progress_interval=progress_interval,
+        require_writeblock=require_writeblock,
+        try_writeblock=try_writeblock,
+        auto_seal=auto_seal,
+        allow_system_disk=allow_system_disk,
+        allow_dest_on_source=allow_dest_on_source,
+        split_bytes=0,
+        read_error_mode=read_error_mode,
+        read_retries=read_retries,
     )
     return run_acquisition(opts)
 
@@ -329,8 +389,14 @@ def run_resume(
 def verify_image(image_path: Path, hash_path: Path) -> dict[str, str]:
     expected = parse_hash_file(hash_path)
     wanted = tuple(a for a in ("md5", "sha1", "sha256", "sha512") if a in expected)
-    current = hash_file(image_path, algorithms=wanted)
+    if image_path.exists():
+        current = hash_file(image_path, algorithms=wanted)
+    elif Path(f"{image_path}.001").exists():
+        current = hash_segmented_prefix(image_path, algorithms=wanted)
+    else:
+        raise FileNotFoundError(image_path)
     mismatch = {k: (expected.get(k), current.get(k)) for k in wanted if expected.get(k) != current.get(k)}
     if mismatch:
         raise RuntimeError(f"hash mismatch: {mismatch}")
-    return current
+    # Preserve only hash fields for compatibility with existing callers.
+    return {k: current[k] for k in wanted}

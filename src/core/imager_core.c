@@ -117,12 +117,25 @@ static int get_source_size(int fd, uint64_t *out) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s <source_path> <dest_path> <hash_path> <audit_log_path> [buffer_size] [sha512=0|1] [start_offset] [max_bytes] [append_mode=0|1] [progress_sec]\n",
+            "Usage: %s <source_path> <dest_path> <hash_path> <audit_log_path> [buffer_size] [sha512=0|1] [start_offset] [max_bytes] [append_mode=0|1] [progress_sec] [segment_bytes] [read_error_mode] [read_retries]\n",
             prog);
 }
 
+static int open_segment(const char *prefix, unsigned int idx, int append_mode, int *out_fd) {
+    char path[4096];
+    // 3-digit segments are common in forensic tooling.
+    snprintf(path, sizeof(path), "%s.%03u", prefix, idx);
+
+    int flags = O_WRONLY | O_CREAT | O_CLOEXEC;
+    flags |= append_mode ? O_APPEND : O_TRUNC;
+    int fd = open(path, flags, 0640);
+    if (fd < 0) return -1;
+    *out_fd = fd;
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 5 || argc > 11) {
+    if (argc < 5 || argc > 14) {
         usage(argv[0]);
         return 2;
     }
@@ -137,12 +150,27 @@ int main(int argc, char **argv) {
     uint64_t max_bytes = (argc >= 9) ? strtoull(argv[8], NULL, 10) : 0;
     int append_mode = (argc >= 10) ? atoi(argv[9]) : 0;
     int progress_sec = (argc >= 11) ? atoi(argv[10]) : 1;
+    uint64_t segment_bytes = (argc >= 12) ? strtoull(argv[11], NULL, 10) : 0;
+    int read_error_mode = (argc >= 13) ? atoi(argv[12]) : 0; // 0=zero-fill continue, 1=fail-fast
+    int read_retries = (argc >= 14) ? atoi(argv[13]) : 3;
 
     if (buffer_size < 4096) {
         fprintf(stderr, "buffer_size too small\n");
         return 2;
     }
     if (progress_sec < 0) progress_sec = 0;
+    if (read_retries < 0) read_retries = 0;
+
+    if (segment_bytes > 0) {
+        if (append_mode || start_offset != 0) {
+            fprintf(stderr, "segment_bytes is incompatible with append_mode or start_offset\n");
+            return 2;
+        }
+        if (segment_bytes < 1024 * 1024) {
+            fprintf(stderr, "segment_bytes too small\n");
+            return 2;
+        }
+    }
 
     int src_fd = open(source, O_RDONLY | O_CLOEXEC);
     if (src_fd < 0) {
@@ -150,13 +178,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int dst_flags = O_WRONLY | O_CREAT | O_CLOEXEC;
-    dst_flags |= append_mode ? O_APPEND : O_TRUNC;
-    int dst_fd = open(dest, dst_flags, 0640);
-    if (dst_fd < 0) {
-        perror("open destination");
-        close(src_fd);
-        return 1;
+    int dst_fd = -1;
+    unsigned int segment_idx = 1;
+    uint64_t segment_written = 0;
+    if (segment_bytes > 0) {
+        if (open_segment(dest, segment_idx, 0, &dst_fd) != 0) {
+            perror("open destination segment");
+            close(src_fd);
+            return 1;
+        }
+    } else {
+        int dst_flags = O_WRONLY | O_CREAT | O_CLOEXEC;
+        dst_flags |= append_mode ? O_APPEND : O_TRUNC;
+        dst_fd = open(dest, dst_flags, 0640);
+        if (dst_fd < 0) {
+            perror("open destination");
+            close(src_fd);
+            return 1;
+        }
     }
 
     if (start_offset > 0 && lseek(src_fd, (off_t)start_offset, SEEK_SET) == (off_t)-1) {
@@ -247,12 +286,26 @@ int main(int argc, char **argv) {
             if (remain < to_read) to_read = (size_t)remain;
         }
 
-        ssize_t n = read(src_fd, buf, to_read);
+        ssize_t n = -1;
+        int tries = 0;
+        for (;;) {
+            n = read(src_fd, buf, to_read);
+            if (n >= 0) break;
+            if (errno == EINTR) continue;
+            if (tries >= read_retries) break;
+            tries++;
+            usleep(20000);
+        }
         if (n == 0) break;
         if (n < 0) {
-            if (errno == EINTR) continue;
             read_errors++;
             log_json(logf, "WARN", "read_error", absolute_offset, "errno", strerror(errno));
+
+            if (read_error_mode == 1) {
+                log_json(logf, "ERROR", "read_error_fail_fast", absolute_offset, "errno", strerror(errno));
+                exit_code = 1;
+                break;
+            }
 
             if (lseek(src_fd, 512, SEEK_CUR) == (off_t)-1) {
                 log_json(logf, "ERROR", "lseek_failed_after_read_error", absolute_offset, "errno", strerror(errno));
@@ -262,11 +315,36 @@ int main(int argc, char **argv) {
 
             unsigned char zero[512];
             memset(zero, 0, sizeof(zero));
-            if (write(dst_fd, zero, sizeof(zero)) != (ssize_t)sizeof(zero)) {
-                log_json(logf, "ERROR", "write_zero_sector_failed", absolute_offset, "errno", strerror(errno));
-                exit_code = 1;
-                break;
+            // Write through the segmenter if enabled.
+            size_t zwritten = 0;
+            while (zwritten < sizeof(zero)) {
+                if (segment_bytes > 0 && segment_written >= segment_bytes) {
+                    fsync(dst_fd);
+                    close(dst_fd);
+                    segment_idx++;
+                    segment_written = 0;
+                    if (open_segment(dest, segment_idx, 0, &dst_fd) != 0) {
+                        log_json(logf, "ERROR", "open_next_segment_failed", absolute_offset, "errno", strerror(errno));
+                        exit_code = 1;
+                        break;
+                    }
+                }
+                size_t can = sizeof(zero) - zwritten;
+                if (segment_bytes > 0) {
+                    uint64_t seg_rem = segment_bytes - segment_written;
+                    if (seg_rem < can) can = (size_t)seg_rem;
+                }
+                ssize_t w = write(dst_fd, zero + zwritten, can);
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    log_json(logf, "ERROR", "write_zero_sector_failed", absolute_offset, "errno", strerror(errno));
+                    exit_code = 1;
+                    break;
+                }
+                zwritten += (size_t)w;
+                segment_written += (uint64_t)w;
             }
+            if (exit_code != 0) break;
             if (update_hashes(&hashes, zero, sizeof(zero)) != 0) {
                 log_json(logf, "ERROR", "hash_update_failed", absolute_offset, NULL, NULL);
                 exit_code = 1;
@@ -279,7 +357,25 @@ int main(int argc, char **argv) {
 
         ssize_t written = 0;
         while (written < n) {
-            ssize_t w = write(dst_fd, buf + written, (size_t)(n - written));
+            if (segment_bytes > 0 && segment_written >= segment_bytes) {
+                fsync(dst_fd);
+                close(dst_fd);
+                segment_idx++;
+                segment_written = 0;
+                if (open_segment(dest, segment_idx, 0, &dst_fd) != 0) {
+                    log_json(logf, "ERROR", "open_next_segment_failed", absolute_offset, "errno", strerror(errno));
+                    exit_code = 1;
+                    break;
+                }
+            }
+
+            size_t can = (size_t)(n - written);
+            if (segment_bytes > 0) {
+                uint64_t seg_rem = segment_bytes - segment_written;
+                if (seg_rem < can) can = (size_t)seg_rem;
+            }
+
+            ssize_t w = write(dst_fd, buf + written, can);
             if (w < 0) {
                 if (errno == EINTR) continue;
                 log_json(logf, "ERROR", "write_error", absolute_offset, "errno", strerror(errno));
@@ -287,6 +383,7 @@ int main(int argc, char **argv) {
                 break;
             }
             written += w;
+            segment_written += (uint64_t)w;
         }
         if (exit_code != 0) break;
 
@@ -330,6 +427,8 @@ int main(int argc, char **argv) {
             fprintf(hashf, "start_offset=%llu\n", (unsigned long long)start_offset);
             fprintf(hashf, "copied_bytes=%llu\n", (unsigned long long)copied);
             fprintf(hashf, "absolute_end_offset=%llu\n", (unsigned long long)absolute_offset);
+            fprintf(hashf, "segment_bytes=%llu\n", (unsigned long long)segment_bytes);
+            if (segment_bytes > 0) fprintf(hashf, "segments=%u\n", segment_idx);
             fprintf(hashf, "md5=%s\n", md5_hex);
             fprintf(hashf, "sha1=%s\n", sha1_hex);
             fprintf(hashf, "sha256=%s\n", sha256_hex);

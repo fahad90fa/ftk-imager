@@ -9,6 +9,8 @@ from typing import Any
 
 def generate_text_report(report_path: Path, case_data: dict[str, Any]) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    bad = case_data.get("bad_sectors") or {}
+    seg_hashes = case_data.get("segment_hashes") or {}
     lines = [
         "Forensic Acquisition Report",
         "==========================",
@@ -18,6 +20,12 @@ def generate_text_report(report_path: Path, case_data: dict[str, Any]) -> None:
         f"Examiner: {case_data.get('examiner', '-')}",
         f"Started: {case_data.get('started_at', '-')}",
         f"Completed: {case_data.get('completed_at', '-')}",
+        "",
+        "Workstation",
+        "-----------",
+        f"Hostname: {case_data.get('hostname', '-')}",
+        f"System state: {case_data.get('system_state_path', '-')}",
+        f"Tool info: {json.dumps(case_data.get('tool_info', {}), sort_keys=True)}",
         "",
         "Source Device",
         "-------------",
@@ -29,6 +37,13 @@ def generate_text_report(report_path: Path, case_data: dict[str, Any]) -> None:
         f"Image Path: {case_data.get('image_path', '-')}",
         f"Hashes: {json.dumps(case_data.get('hashes', {}), sort_keys=True)}",
         f"Read Errors: {case_data.get('read_errors', '-')}",
+        f"Segment hash summary: {json.dumps(seg_hashes, sort_keys=True)}",
+        "",
+        "Bad Sector Map",
+        "--------------",
+        f"Count: {bad.get('bad_sectors_count', '0')}",
+        f"JSON: {bad.get('bad_sectors_json', '-')}",
+        f"Text: {bad.get('bad_sectors_txt', '-')}",
         "",
         "Audit",
         "-----",

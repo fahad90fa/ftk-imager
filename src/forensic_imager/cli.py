@@ -60,6 +60,11 @@ def _build_acquire_options(args: argparse.Namespace) -> AcquireOptions:
         require_writeblock=args.require_writeblock,
         try_writeblock=args.try_writeblock,
         auto_seal=args.auto_seal,
+        allow_system_disk=args.allow_system_disk,
+        allow_dest_on_source=args.allow_dest_on_source,
+        split_bytes=args.split_bytes,
+        read_error_mode=1 if args.fail_fast_bad_sectors else 0,
+        read_retries=args.read_retries,
     )
 
 
@@ -70,6 +75,8 @@ def cmd_acquire(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    if getattr(args, "split_bytes", 0):
+        raise SystemExit("resume does not support segmented outputs; do not use --split-bytes with resume")
     out = run_resume(
         source=args.source,
         output_image=Path(args.output_image),
@@ -83,6 +90,13 @@ def cmd_resume(args: argparse.Namespace) -> int:
         sha512=args.sha512,
         core_binary=Path(args.core_binary),
         progress_interval=args.progress_interval,
+        require_writeblock=args.require_writeblock,
+        try_writeblock=args.try_writeblock,
+        auto_seal=args.auto_seal,
+        allow_system_disk=args.allow_system_disk,
+        allow_dest_on_source=args.allow_dest_on_source,
+        read_error_mode=1 if args.fail_fast_bad_sectors else 0,
+        read_retries=args.read_retries,
     )
     print(json.dumps(out, indent=2))
     return 0
@@ -389,6 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_acq.add_argument("--require-writeblock", action="store_true", help="Fail unless source device is RO=1")
     s_acq.add_argument("--try-writeblock", action="store_true", help="Attempt to set RO using blockdev (root)")
     s_acq.add_argument("--auto-seal", action="store_true", help="Seal case after acquisition completes")
+    s_acq.add_argument("--allow-system-disk", action="store_true", help="Allow imaging a device that appears to contain '/'")
+    s_acq.add_argument("--allow-dest-on-source", action="store_true", help="Allow destination path on the same base disk as source")
+    s_acq.add_argument("--split-bytes", type=int, default=0, help="Split raw output into <prefix>.001/.002... with max bytes per segment")
+    s_acq.add_argument("--fail-fast-bad-sectors", action="store_true", help="Abort acquisition on first read error")
+    s_acq.add_argument("--read-retries", type=int, default=3, help="Retries per read error before applying policy")
     s_acq.set_defaults(func=cmd_acquire)
 
     s_resume = sub.add_parser("resume", help="Resume interrupted raw acquisition")
@@ -407,6 +426,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_resume.add_argument("--require-writeblock", action="store_true")
     s_resume.add_argument("--try-writeblock", action="store_true")
     s_resume.add_argument("--auto-seal", action="store_true")
+    s_resume.add_argument("--allow-system-disk", action="store_true")
+    s_resume.add_argument("--allow-dest-on-source", action="store_true")
+    s_resume.add_argument("--split-bytes", type=int, default=0)
+    s_resume.add_argument("--fail-fast-bad-sectors", action="store_true")
+    s_resume.add_argument("--read-retries", type=int, default=3)
     s_resume.set_defaults(func=cmd_resume)
 
     s_verify = sub.add_parser("verify", help="Verify image hash file")
